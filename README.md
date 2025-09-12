@@ -1,1 +1,1 @@
-#The backend of our Agrifood projet for gigahack2025 
+#The backend of our Agrifood project for gigahack2025 
