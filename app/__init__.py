@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify
 from sqlalchemy import create_engine, text
 from .routes import bp as main_bp
+from .subsidies.routes import bp_subsidy
 
 from flask_cors import CORS
 
@@ -16,6 +17,7 @@ def create_app():
     CORS(app, resources={r"/api/*": {"origins": "*"}})
 
     app.register_blueprint(main_bp)  # This includes both / and /api/scraper/*
+    app.register_blueprint(bp_subsidy)
 
     @app.get("/db")
     def db_now():

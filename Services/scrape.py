@@ -1,10 +1,11 @@
 import os, re, json, pathlib, urllib.parse, tempfile
 import requests
 from bs4 import BeautifulSoup
-
+import io
 from pypdf import PdfReader
 from docx import Document as DocxDocument
 import pandas as pd
+import tempfile, shutil
 
 USE_OPENAI = True
 try:
@@ -12,7 +13,7 @@ try:
 except Exception:
     USE_OPENAI = False
 
-DEFAULT_EXTS = [".pdf", ".docx", ".xlsx"]
+DEFAULT_EXTS = [".pdf", ".docx", ".xlsx", ".doc", ".xls"]  
 MAX_CHARS = 15000
 
 def to_abs(url, base): return urllib.parse.urljoin(base, url)
@@ -57,20 +58,29 @@ def extract_text_from_pdf(path: pathlib.Path) -> str:
             parts.append(f"\n\n=== [PDF page {i+1}] ===\n{t}")
     return "".join(parts).strip()
 
+
 def extract_text_from_docx(path: pathlib.Path) -> str:
-    doc = DocxDocument(str(path))
+    # Open → read → close; then python-docx works from memory
+    with open(path, "rb") as f:
+        data = f.read()
+    doc = DocxDocument(io.BytesIO(data))
     return "\n".join(p.text for p in doc.paragraphs).strip()
 
 def extract_text_from_xlsx(path: pathlib.Path) -> str:
     try:
-        xl = pd.ExcelFile(path)
+        # Read into memory first so no OS file handle stays open
+        with open(path, "rb") as f:
+            data = f.read()
+
+        # Use ExcelFile as a context manager to guarantee close()
+        with pd.ExcelFile(io.BytesIO(data)) as xl:
+            parts = []
+            for sheet in xl.sheet_names:
+                df = xl.parse(sheet).iloc[:200, :30]
+                parts.append(f"\n\n=== [Sheet: {sheet}] ===\n{df.to_csv(index=False)}")
+            return "".join(parts).strip()
     except Exception as e:
         return f"[Could not open Excel: {e}]"
-    parts = []
-    for sheet in xl.sheet_names:
-        df = xl.parse(sheet).iloc[:200, :30]
-        parts.append(f"\n\n=== [Sheet: {sheet}] ===\n{df.to_csv(index=False)}")
-    return "".join(parts).strip()
 
 def extract_text(path: pathlib.Path) -> str:
     ext = path.suffix.lower()
@@ -89,6 +99,24 @@ def openai_client():
     if not api_key:
         raise RuntimeError("Set OPENAI_API_KEY first")
     return OpenAI(api_key=api_key)
+
+def _extract_json(text: str) -> dict:
+    """
+    Try hard to parse JSON from a model reply:
+    - handle code fences
+    - fallback to the largest {...} block
+    """
+    if not text:
+        return {}
+    # strip code fences if present
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            pass
+    # last resort: return empty
+    return {}
 
 def summarize_with_openai(text: str, filename: str, *, lang: str = "ro", model: str | None = None, max_chunks: int = 3) -> dict:
     """
@@ -113,39 +141,59 @@ def summarize_with_openai(text: str, filename: str, *, lang: str = "ro", model: 
     joined = "\n\n".join(chunks[:max_chunks])
 
     prompt = (
-        f"Sarcină: oferă o descriere **foarte concisă** (2–3 propoziții, max 60 de cuvinte) "
+        f"Sarcină: oferă o descriere foarte concisă (2–3 propoziții, max 60 de cuvinte) "
         f"care explică exact despre ce este fișierul «{filename}», pentru cine este și ce acțiune permite.\n"
-        f"Identifică și tipul documentului (una dintre: cerere, ghid, fișă de calcul, anexă, contract, altele).\n"
-        f"Limba răspunsului: {lang}.\n\n"
+        f"Identifică tipul documentului (una dintre: cerere, ghid, fișă de calcul, anexă, contract, altele).\n"
+        f"Limba răspunsului: {lang}.\n"
         "Returnează STRICT JSON (fără text în afara JSON-ului) cu cheile exacte:\n"
         "{\n"
         '  "filename": string,\n'
         '  "language": string,\n'
         '  "doc_type": string,\n'
-        '  "about": string  // 2–3 propoziții, fără liste\n'
+        '  "about": string\n'
         "}\n\n"
         "Text:\n"
         f"{joined}"
     )
 
-    resp = client.responses.create(
-        model=model,
-        input=[{"role": "user", "content": prompt}],
-    )
-    raw = resp.output_text
     try:
+        chat = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            # Many SDK versions support this. If your local version doesn't, we catch TypeError below.
+            response_format={"type": "json_object"},
+            temperature=0
+        )
+        raw = chat.choices[0].message.content
         data = json.loads(raw)
-        # Ensure required keys exist (light post-validate)
+    except TypeError:
+        # Older SDK: no response_format param — ask nicely and parse
+        chat = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
+        raw = chat.choices[0].message.content
+        data = _extract_json(raw)
+    except Exception as e:
+        # As a final fallback, return minimal info so pipeline keeps going
         return {
-            "filename": data.get("filename", filename),
-            "language": data.get("language", lang),
-            "doc_type": data.get("doc_type", "altele"),
-            "about": data.get("about", ""),
+            "filename": filename,
+            "language": lang,
+            "doc_type": "altele",
+            "about": f"[Eroare OpenAI: {e}]"
         }
-    except Exception:
-        # If model returned non-JSON, keep the raw text (debug)
-        return {"filename": filename, "language": lang, "doc_type": "altele", "about": "", "raw": raw}
-    
+
+    # Light post-validate
+    if not isinstance(data, dict) or "about" not in data:
+        data = _extract_json(raw) if 'raw' in locals() else {}
+
+    return {
+        "filename": data.get("filename", filename),
+        "language": data.get("language", lang),
+        "doc_type": data.get("doc_type", "altele"),
+        "about": data.get("about", "")
+    }
     
 def scrape_and_summarize(pages: list[str], *, exts=DEFAULT_EXTS, lang="ro", save_dir: str | None = None, dry_run=False):
     # Discover links
@@ -158,6 +206,9 @@ def scrape_and_summarize(pages: list[str], *, exts=DEFAULT_EXTS, lang="ro", save
         return {"links": all_links}
 
     # Download + extract + summarize
+# services/scrape.py  (only the loop body shown)
+
+    # Download + extract + summarize
     results, errors = [], []
     tmp_ctx = tempfile.TemporaryDirectory() if not save_dir else None
     base_out = pathlib.Path(save_dir or tmp_ctx.name)
@@ -167,8 +218,16 @@ def scrape_and_summarize(pages: list[str], *, exts=DEFAULT_EXTS, lang="ro", save
             fpath = download(url, files_dir)
             text = extract_text(fpath)
             summary = summarize_with_openai(text, fpath.name, lang=lang)
-            results.append({"url": url, "filename": fpath.name, "summary": summary})
+            # NEW: add extension + short preview (safe to miss if text == "")
+            results.append({
+                "url": url,
+                "filename": fpath.name,
+                "ext": fpath.suffix.lower().lstrip("."),   # e.g., "pdf"
+                "summary": summary,
+                "text_preview": (text or "")[:1000]        # store ~1k chars for search
+            })
         except Exception as e:
             errors.append({"url": url, "error": str(e)})
     if tmp_ctx: tmp_ctx.cleanup()
     return {"links": all_links, "results": results, "errors": errors}
+
