@@ -5,6 +5,7 @@ __pycache__/
 *.pyd
 *.so
 
+app/__pycache__
 .venv/
 venv/
 env/
