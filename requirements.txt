@@ -1,0 +1,7 @@
+requests
+beautifulsoup4
+pypdf
+python-docx
+openpyxl
+pandas
+openai
