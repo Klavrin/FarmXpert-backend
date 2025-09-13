@@ -34,11 +34,28 @@ def farm_profile(conn, business_id: int) -> Dict[str, Any]:
     prof: Dict[str, Any] = {"businessId": int(business_id)}
 
     # fields
-    rows = conn.execute(
-        text('select "cropType" as cropType, size from public.field where "businessId"=:b'),
-        {"b": business_id}
-    ).mappings().all()
-    fields = [{"cropType": r["cropType"], "size": float(r["size"])} for r in rows]
+    # FIELDS (safe quoting + tolerant mapping)
+    try:
+        rows = conn.execute(text(
+            'select "cropType" as crop_type, coalesce(size,0) as size '
+            'from public."field" where "businessId" = :b'
+        ), {"b": business_id}).mappings().all()
+    except Exception:
+        conn.rollback()
+        rows = []
+
+    fields = [{
+        # accept either alias (crop_type) or mixed/lower keys if the driver rewrites them
+        "cropType": (r.get("crop_type") or r.get("cropType") or r.get("croptype") or ""),
+        "size": float(r.get("size") or 0)
+    } for r in rows]
+
+
+    fields = [{
+        "cropType": (r.get("cropType") or r.get("croptype") or ""),
+        "size": float(r.get("size") or 0)
+    } for r in rows]
+
     prof["fields"] = fields
     prof["totalHa"] = sum(f["size"] for f in fields)
 
@@ -52,18 +69,27 @@ def farm_profile(conn, business_id: int) -> Dict[str, Any]:
         text('select type, coalesce(amount,0) as amount from public.cattle where "businessId"=:b'),
         {"b": business_id}
     ).mappings().all()
-    prof["livestock"] = [{"type": r["type"], "amount": int(r["amount"])} for r in cattle]
+    prof["livestock"] = [{
+    "type": (r.get("type") or ""),
+    "amount": int(r.get("amount") or 0)
+    } for r in cattle]
+
     prof["totalAnimals"] = sum(x["amount"] for x in prof["livestock"])
 
     # machinery
     machines = conn.execute(text("""
-        select v."vehicleType" as vehicleType, count(*) as n
-        from public.vehicle v
-        join public.vehicleGroup g on v."vehicleGroupId" = g.id
+        select v."vehicleType" as "vehicleType", count(*) as n
+        from public."vehicle" v
+        join public."vehicleGroup" g on v."vehicleGroupId" = g.id
         where g."businessId" = :b
         group by v."vehicleType"
     """), {"b": business_id}).mappings().all()
-    prof["machinery"] = [{"type": r["vehicleType"], "count": int(r["n"])} for r in machines]
+
+    prof["machines"] = [{
+        "vehicleType": (m.get("vehicleType") or m.get("vehicletype") or ""),
+        "n": int(m.get("n") or 0)
+    } for m in machines]
+
 
     # finance (latest)
     fin = conn.execute(text("""
