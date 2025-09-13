@@ -1,14 +1,14 @@
 import os
 from dotenv import load_dotenv
 from flask import Flask, jsonify
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from .routes import bp as main_bp
-from .subsidies.routes import bp_subsidy
+from .match.routes import bp_match
+from .apply.routes import bp_apply
+from app.subsidies.routes import bp_sub as subsidies_bp
+from .db_utilis import engine
 
 from flask_cors import CORS
-
-load_dotenv()
-engine = create_engine(os.environ["DATABASE_URL"])
 
 def create_app():
     app = Flask(__name__)
@@ -17,7 +17,9 @@ def create_app():
     CORS(app, resources={r"/api/*": {"origins": "*"}})
 
     app.register_blueprint(main_bp)  # This includes both / and /api/scraper/*
-    app.register_blueprint(bp_subsidy)
+    app.register_blueprint(bp_match)
+    app.register_blueprint(bp_apply)
+    app.register_blueprint(subsidies_bp)
 
     @app.get("/db")
     def db_now():

@@ -3,7 +3,7 @@ import os, json, re, pathlib, shutil
 from flask import Blueprint, request, jsonify, current_app, send_from_directory
 from sqlalchemy import text
 from datetime import datetime
-from app.db_utilis import engine
+from app import engine
 
 from app.services.farm_profile import load_farm_profile
 from app.services.ai_score import score_one, infer_code_from_filename
