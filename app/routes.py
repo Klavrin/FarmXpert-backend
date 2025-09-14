@@ -6,6 +6,188 @@ from sqlalchemy import text
 from app.db_utilis import engine
 from docx import Document
 
+# --- Load profile by userId (users + fields + finance; animals optional) ---
+def _load_profile_by_user_id(user_id: int) -> dict:
+    """
+    Builds a profile dict the fill code already understands:
+    {
+      "user": {...}, "business": {"idno": ...},
+      "fields": [...], "finance": {...}, "animals": [...]
+    }
+    Only relies on the tables you shared. 'animals' is best-effort.
+    """
+    with engine.connect() as conn:
+        u = conn.execute(text("""
+            select "userId", "firstName", "lastName", "businessId", phone, email
+            from public.users
+            where "userId" = :uid
+        """), {"uid": user_id}).mappings().first()
+        if not u:
+            return {}
+
+        bid = u["businessId"]
+
+        fields = conn.execute(text("""
+            select id, "cropType", size, "soilType", fertiliser, herbicide
+            from public.field
+            where "businessId" = :bid
+            order by id asc
+        """), {"bid": bid}).mappings().all()
+
+        finance = conn.execute(text("""
+            select id, "yearlyIncome", "yearlyExpenses", "updatedAt"
+            from public.finance
+            where "businessId" = :bid
+            order by "updatedAt" desc nulls last
+            limit 1
+        """), {"bid": bid}).mappings().first()
+
+        # 'animal' table in your schema doesn’t have businessId; try best-effort if it does exist.
+        animals = []
+        try:
+            animals = conn.execute(text("""
+                select id, species, sex, "birthDate"
+                from public.animal
+                where "businessId" = :bid
+                order by id asc
+            """), {"bid": bid}).mappings().all()
+        except Exception:
+            # table/column might not exist with that shape — ignore
+            pass
+
+    return {
+        "user": dict(u),
+        "business": {"idno": str(bid)},
+        "fields": [dict(r) for r in (fields or [])],
+        "finance": (dict(finance) if finance else {}),
+        "animals": [dict(a) for a in (animals or [])],
+    }
+
+
+# --- Blank-ish detection & profile→suggestions ------------------------------
+NBSP = "\u00A0"
+BLANKISH_LINE = re.compile(r"^[\s\.\-–—_·•]{3,}$")  # dotted leaders / dashes / underscores
+
+def _clean_ws(s: str) -> str:
+    return (s or "").replace(NBSP, " ").strip()
+
+def _is_blankish(s: str) -> bool:
+    t = _clean_ws(s)
+    if not t:
+        return True
+    # sequences like "........", "———", "_____"
+    if BLANKISH_LINE.match(t):
+        return True
+    # table “spacer” cells sometimes keep only very short garbage
+    return t in {".", "..", "…", "-"}  # be lenient
+
+
+def _flatten_profile(profile: dict) -> dict:
+    """Flatten a nested profile dict into label-like keys for matching."""
+    out = {}
+    if not isinstance(profile, dict):
+        return out
+
+    def add(k, v):
+        k = (_slug(k).replace("_", " ") or "").strip().lower()
+        if not k:
+            return
+        out[k] = str(v)
+
+    def walk(prefix, d):
+        if isinstance(d, dict):
+            for k, v in d.items():
+                key = f"{prefix} {k}".strip()
+                if isinstance(v, (dict, list)):
+                    walk(key, v)
+                else:
+                    add(key, v)
+        elif isinstance(d, list):
+            for i, v in enumerate(d, 1):
+                walk(f"{prefix} {i}", v)
+        else:
+            add(prefix, d)
+
+    walk("", profile)
+
+    # Friendly Romanian label aliases pulled from nested places
+    user = profile.get("user", {}) or {}
+    business = profile.get("business", {}) or {}
+
+    fn = user.get("firstName") or user.get("first_name")
+    ln = user.get("lastName") or user.get("last_name")
+    if fn or ln:
+        full = f"{fn or ''} {ln or ''}".strip()
+        out["numele si prenumele"] = full
+        out["numele și prenumele"] = full
+
+    if user.get("phone"):
+        out["telefon"] = str(user["phone"])
+
+    if user.get("email"):
+        out["email"] = str(user["email"])
+        out["e mail"] = str(user["email"])
+
+    idno = business.get("idno") or user.get("businessId") or business.get("businessId")
+    if idno:
+        out["cod fiscal (idno)"] = str(idno)
+        out["idno"] = str(idno)
+
+    return out
+
+
+# --- Label/cell fill helpers -----------------------------------------------
+LABEL_LINE = re.compile(r"^[A-Za-zĂÂÎȘȚăâîșț0-9/(),.\- ]{3,120}$")
+
+def _is_labelish(text: str) -> bool:
+    t = (text or "").strip()
+    if not t or len(t) > 120:
+        return False
+    if not LABEL_LINE.match(t):
+        return False
+    # avoid obvious value-looking lines (long numbers etc.)
+    if re.search(r"\b\d{6,}\b", t):
+        return False
+    return True
+
+def _apply_label_and_cell_fill(doc: Document, suggestions: dict):
+    """Fill empty cells to the right of label cells and label-only paragraphs."""
+    def pick(label: str):
+        # try exact by normalized label, then fuzzy
+        lbln = _slug(label).replace("_", " ")
+        if lbln in suggestions:
+            return suggestions.get(lbln)
+        key = _best_suggestion_for(_slug(label), suggestions) or _best_suggestion_for(label, suggestions)
+        return suggestions.get(key)
+
+    # 1) Tables: label in left cell + blank-ish right cell → fill right cell
+    for table in doc.tables:
+        for row in table.rows:
+            cells = row.cells
+            if len(cells) < 2:
+                continue
+            for i in range(len(cells) - 1):
+                left_txt = _clean_ws(cells[i].text)
+                right_txt = cells[i+1].text
+                if _is_labelish(left_txt) and _is_blankish(right_txt):
+                    val = pick(left_txt)
+                    if val:
+                        cells[i+1].text = val
+
+    # 2) Paragraph pairs: “label-only” line followed by blank-ish line → append value to label line
+    paras = list(doc.paragraphs)
+    for idx, p in enumerate(paras):
+        t = _clean_ws(p.text)
+        if not _is_labelish(t):
+            continue
+        nxt = paras[idx+1].text if idx + 1 < len(paras) else ""
+        if not _is_blankish(nxt):
+            continue
+        val = pick(t)
+        if val:
+            p.add_run(f" «{val}»")
+
+
 # helper to copy basic run formatting
 def _copy_run_formatting(src_run, dst_run):
     try:
@@ -1116,6 +1298,13 @@ def complete_docx():
     instructions = data.get("instructions")
     profile = data.get("profile") or {}
 
+    user_id = data.get("userId") or data.get("user_id")
+    if user_id and not profile:
+        try:
+            profile = _load_profile_by_user_id(int(user_id)) or {}
+        except Exception:
+            profile = profile or {}  # keep empty if anything goes wrong
+
     try:
         with engine.begin() as conn:
             url = _resolve_source_to_url(data, conn)
@@ -1135,8 +1324,23 @@ def complete_docx():
         # 3) ask AI (or fallback) for values
         suggestions = _ai_fill_fields(fields, profile=profile, instructions=instructions, language=language)
 
+        # 3b) enrich suggestions so label-only lines can be filled
+        # 3b) enrich suggestions so label-only lines can be filled (no defaults)
+        profile_flat = {k.lower(): v for k, v in _flatten_profile(profile).items()}
+
+        ai_sugs = suggestions or {}
+        suggestions = {}
+        # profile-derived labels first (so labels like “Telefon”, “Email”, etc. are available)
+        suggestions.update(profile_flat)
+        # then AI suggestions for “_____” blanks (normalize their keys to be label-ish too)
+        suggestions.update({k.lower().replace("_", " "): v for k, v in ai_sugs.items()})
+
+
         # 4) apply inline
         _apply_suggestions_inline(doc, suggestions)
+
+        # 4b) NEW: also fill label-only lines and table cells
+        _apply_label_and_cell_fill(doc, suggestions)
 
         # 5) add a small header explaining markers (first page, top)
         hdr = doc.paragraphs[0] if doc.paragraphs else doc.add_paragraph()
