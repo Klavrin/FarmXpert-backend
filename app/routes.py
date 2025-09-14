@@ -939,6 +939,127 @@ def autocomplete_docs():
     except Exception as e:
         return jsonify(error="autocomplete_failed", details=str(e)), 500
 
+        # --- start: load subsidy titles/summaries and optionally generate AI suggestions ---
+    # collect unique measure codes from result rows
+    codes = sorted({r[5] for r in rows if r[5]})
+    subsidy_map = {}  # code -> {"title":..., "summary":...}
+
+    if codes:
+        # batch query existing subsidies
+        try:
+            q = text("""
+                select code, coalesce(title, '') as title, coalesce(summary, '') as summary
+                from public.subsidy
+                where code = any(:codes)
+            """)
+            with engine.connect() as conn2:
+                db_rows = conn2.execute(q, {"codes": list(codes)}).fetchall()
+            for r in db_rows:
+                subsidy_map[r["code"]] = {"title": r["title"], "summary": r["summary"], "source": "db"}
+        except Exception:
+            # if anything fails, keep going with empty subsidy_map
+            pass
+
+    # Decide which codes need AI help (missing title or short summary)
+    need_ai = []
+    for c in codes:
+        s = subsidy_map.get(c)
+        if not s or (not s.get("title") and (not s.get("summary") or len(s.get("summary","")) < 40)):
+            need_ai.append(c)
+
+    # cap AI calls to avoid too many requests (tweak as you like)
+    MAX_AI_SUGGEST = 10
+    if need_ai:
+        need_ai = need_ai[:MAX_AI_SUGGEST]
+
+    def _ai_suggest_subsidy(code: str, hint: str = "", lang: str = "ro") -> dict:
+        """
+        Return {'title': str, 'summary': str} or {} on failure.
+        Uses OpenAI (new SDK then fallback). Keep prompts short and request JSON.
+        """
+        prompt = (
+            f"Language: {lang}\n"
+            f"You're a concise assistant that proposes a short formal title (max 8 words) "
+            f"and a 1-2 sentence summary (Romanian) for a government subsidy/measure.\n"
+            f"Input:\n  code: {code}\n  hint: {hint}\n\n"
+            "Respond ONLY with a JSON object like: {\"title\":\"...\",\"summary\":\"...\"}."
+        )
+        try:
+            # try new SDK
+            try:
+                from openai import OpenAI
+                client = OpenAI()
+                resp = client.chat.completions.create(
+                    model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                    messages=[{"role":"user","content":prompt}],
+                    temperature=0.2,
+                    max_tokens=300,
+                )
+                raw = (resp.choices[0].message.content or "").strip()
+            except Exception:
+                import openai
+                openai.api_key = os.getenv("OPENAI_API_KEY")
+                resp = openai.ChatCompletion.create(
+                    model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
+                    messages=[{"role":"user","content":prompt}],
+                    temperature=0.2,
+                    max_tokens=300,
+                )
+                raw = (resp["choices"][0]["message"]["content"] or "").strip()
+
+            # try to parse JSON out of the reply (tolerant)
+            import json as _json
+            try:
+                # find first { ... } block to be resilient to stray text
+                m = re.search(r"\{.*\}", raw, re.S)
+                js = _json.loads(m.group(0)) if m else _json.loads(raw)
+                return {"title": js.get("title","").strip(), "summary": js.get("summary","").strip(), "source": "ai"}
+            except Exception:
+                # fallback: use first line as title, remainder as summary
+                parts = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+                if not parts:
+                    return {}
+                title = parts[0][:80]
+                summary = " ".join(parts[1:])[:300] or ""
+                return {"title": title, "summary": summary, "source": "ai"}
+        except Exception:
+            return {}
+
+    # Generate AI suggestions only for codes that need them
+    ai_suggestions = {}
+    if need_ai:
+        # prepare hints: try to use an example filename or the subsidy_map title if present
+        code_to_hint = {}
+        for r in rows:
+            code = r[5]
+            if code in need_ai and code not in code_to_hint:
+                # use filename + doc_type as a hint
+                code_to_hint[code] = (r[1] or "") + " " + (r[2] or "")
+
+        for c in need_ai:
+            hint = (code_to_hint.get(c) or "").strip()
+            try:
+                s = _ai_suggest_subsidy(c, hint, lang=(lang or "ro"))
+                if s and (s.get("title") or s.get("summary")):
+                    ai_suggestions[c] = s
+            except Exception:
+                pass
+
+    # merge db + ai suggestions into a single map for fast lookup
+    suggestions_map = {}
+    for c in codes:
+        db_entry = subsidy_map.get(c) or {"title":"", "summary": "", "source": "none"}
+        ai_entry = ai_suggestions.get(c)
+        if ai_entry:
+            # prefer DB title if present; keep AI summary if DB summary missing or short
+            title = db_entry.get("title") or ai_entry.get("title")
+            summary = db_entry.get("summary") if len(db_entry.get("summary","") or "") >= 40 else ai_entry.get("summary") or db_entry.get("summary")
+            src = "db+ai" if db_entry.get("title") or db_entry.get("summary") else "ai"
+            suggestions_map[c] = {"title": (title or "").strip(), "summary": (summary or "").strip(), "source": src}
+        else:
+            suggestions_map[c] = {"title": db_entry.get("title","").strip(), "summary": db_entry.get("summary","").strip(), "source": db_entry.get("source","none")}
+    # --- end: subsidy suggestion block ---
+
     items = []
     for (url, filename, doc_type, ext_, language, mcode, _rank) in rows:
         left = (doc_type or "document").strip().capitalize()
@@ -946,6 +1067,14 @@ def autocomplete_docs():
         right = (filename or "").strip()
         ext_up = (ext_ or "").upper()
         label = " — ".join([p for p in [left, mid, f"{right} ({ext_up})"] if p])
+
+        # Defensive: suggestions_map may not exist (if AI block wasn't run), so handle it.
+        sug = None
+        if mcode and 'suggestions_map' in globals():
+            sug = suggestions_map.get(mcode)
+        elif mcode and 'suggestions_map' in locals():
+            sug = suggestions_map.get(mcode)
+
         items.append({
             "label": label,
             "value": url,
@@ -954,7 +1083,11 @@ def autocomplete_docs():
             "ext": ext_,
             "language": language,
             "code": mcode,
+            "suggested_title": (sug.get("title") if sug else None),
+            "suggested_summary": (sug.get("summary") if sug else None),
+            "suggested_source": (sug.get("source") if sug else "none"),
         })
+
 
     return jsonify({"items": items})
 
