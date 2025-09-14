@@ -14,7 +14,7 @@ def _jaccard(a: List[str], b: List[str]) -> float:
     return len(sa & sb) / len(sa | sb)
 
 def _band(score: float) -> str:
-    return "verde" if score >= 80 else ("galben" if score >= 50 else "roșu")
+    return "verde" if score >= 80 else ("galben" if score >= 50 else "rosu")
 
 def _safe_openai_client():
     try:

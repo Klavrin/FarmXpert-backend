@@ -1,108 +1,197 @@
 # app/services/doc_fill.py
 from __future__ import annotations
-import os, re, shutil, pathlib, json, base64, tempfile, urllib.parse
-import requests
-from docx import Document
-import openpyxl
+import io, re, pathlib, json, base64, tempfile, urllib.parse
+from typing import Dict, Any, Tuple, List, Optional
 
-UNDERSCORES = re.compile(r"_{4,}")  # replace long blanks with a value
+UNDERSCORES = re.compile(r"_{4,}")  # sequences of 4+ underscores
+
+
+def _copy_run_formatting(src_run, dst_run):
+    """
+    Copy a few basic formatting properties from src_run to dst_run.
+    This is intentionally conservative (only common attrs) and tolerant to errors.
+    """
+    if src_run is None or dst_run is None:
+        return
+
+    try:
+        # simple boolean properties
+        for attr in ("bold", "italic", "underline", "strike"):
+            if hasattr(src_run, attr) and hasattr(dst_run, attr):
+                setattr(dst_run, attr, getattr(src_run, attr))
+    except Exception:
+        # don't crash on odd run objects
+        pass
+
+    try:
+        # copy font-level attributes if available
+        if hasattr(src_run, "font") and hasattr(dst_run, "font"):
+            sfont = src_run.font
+            dfont = dst_run.font
+            try:
+                if getattr(sfont, "name", None):
+                    dfont.name = sfont.name
+            except Exception:
+                pass
+            try:
+                if getattr(sfont, "size", None):
+                    dfont.size = sfont.size
+            except Exception:
+                pass
+            # color may not exist or be complex; copy if present
+            try:
+                if getattr(sfont, "color", None) and getattr(sfont.color, "rgb", None):
+                    dfont.color.rgb = sfont.color.rgb
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 
 def ensure_dir(p: pathlib.Path):
     p.mkdir(parents=True, exist_ok=True)
 
+
 def safe_filename(name: str) -> str:
-    name = urllib.parse.unquote(name)
-    name = re.sub(r'[:*?"<>|]', "_", name).strip()
-    return name[:200] or "download"
+    """Sanitize a filename (keeps extension if present)."""
+    name = urllib.parse.unquote(str(name or "")).strip()
+    # Replace filesystem-unfriendly chars
+    name = re.sub(r'[\\/:*?"<>|]', "_", name)
+    # Collapse whitespace
+    name = re.sub(r"\s+", " ", name).strip()
+    return (name[:200] or "document")
+
 
 def download_url(url: str, dest: pathlib.Path) -> pathlib.Path:
+    """Download a URL to a path. Gracefully handles missing 'requests'."""
     dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import requests  # lazy import
+    except Exception as e:
+        raise RuntimeError(f"'requests' is not installed: {e}")
+
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
         with open(dest, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1<<20):
+            for chunk in r.iter_content(chunk_size=1 << 20):
                 if chunk:
                     f.write(chunk)
     return dest
 
-def prefill_docx(src_path: pathlib.Path, dest_path: pathlib.Path, suggestions: dict):
-    """
-    Naiv dar eficient: înlocuiește secvențe lungi de underscore cu valori propuse.
-    Dacă într-un paragraf există mai multe câmpuri, punem valorile în ordine.
-    """
-    doc = Document(str(src_path))
-    values = list(suggestions.values()) or ["[completați]"]
-    for para in doc.paragraphs:
-        if "____" in para.text:
-            idx = 0
-            def rep(m):
-                nonlocal idx
-                v = values[min(idx, len(values)-1)]
-                idx += 1
-                return v
-            new_text = UNDERSCORES.sub(rep, para.text)
-            for run in list(para.runs):  # replace text safely
-                run.text = ""
-            para.add_run(new_text)
-    doc.save(str(dest_path))
 
-def prefill_xlsx(src_path: pathlib.Path, dest_path: pathlib.Path, suggestions: dict):
+def prefill_docx(src_path: pathlib.Path, dest_path: pathlib.Path, suggestions: Dict[str, str]):
     """
-    Simplu: scriem un sheet numit 'PROPUNERI' cu valorile cheie->valoare.
-    (Nu stricăm fișele AIPA; utilizatorul le poate copia.)
+    Replace underscore blanks with suggested values, preserving the first run formatting.
     """
-    wb = openpyxl.load_workbook(str(src_path))
     try:
-        sheet = wb.create_sheet("PROPUNERI")
-        sheet["A1"] = "Câmp"
-        sheet["B1"] = "Valoare propusă"
-        r = 2
-        for k, v in suggestions.items():
-            sheet.cell(row=r, column=1).value = k
-            sheet.cell(row=r, column=2).value = v
-            r += 1
+        from docx import Document  # lazy import
+    except Exception:
+        dest_path.write_bytes(src_path.read_bytes())
+        return
+
+    try:
+        doc = Document(str(src_path))
+    except Exception:
+        # fallback minimal doc
+        doc = Document()
+        doc.add_paragraph("CERERE (șablon indisponibil – s-a generat un document minimal)")
+        for k, v in (suggestions or {}).items():
+            doc.add_paragraph(f"{k}: {v}")
+
+    values = list((suggestions or {}).values()) or ["[completați]"]
+    idx = 0
+
+    for para in list(doc.paragraphs):
+        if UNDERSCORES.search(para.text):
+            v = values[min(idx, len(values) - 1)]
+            idx += 1
+            new_text = UNDERSCORES.sub(v, para.text, count=1)
+            # preserve first run formatting
+            first_run = para.runs[0] if para.runs else None
+            for run in list(para.runs):
+                try:
+                    run.text = ""
+                except Exception:
+                    pass
+            new_run = para.add_run(new_text)
+            if first_run:
+                try:
+                    _copy_run_formatting(first_run, new_run)
+                except Exception:
+                    pass
+
+    bio = io.BytesIO()
+    doc.save(bio)
+    dest_path.write_bytes(bio.getvalue())
+
+
+def prefill_xlsx(src_path: pathlib.Path, dest_path: pathlib.Path, suggestions: Dict[str, str]):
+    """
+    Non-destructive: create a 'PROPUNERI' sheet with key->value pairs.
+    If openpyxl isn't installed or file can't be parsed, fall back to copying.
+    """
+    try:
+        import openpyxl  # lazy import
+    except Exception:
+        dest_path.write_bytes(src_path.read_bytes())
+        return
+
+    try:
+        wb = openpyxl.load_workbook(str(src_path))
+    except Exception:
+        wb = openpyxl.Workbook()
+
+    try:
+        ws = wb.create_sheet("PROPUNERI")
+        ws.append(["cheie", "valoare"])
+        for k, v in (suggestions or {}).items():
+            ws.append([k, v])
         wb.save(str(dest_path))
     finally:
-        # Important on Windows so temp files aren't locked
-        wb.close()
+        try:
+            wb.close()
+        except Exception:
+            pass
 
-# ----------------------------- NEW STUFF BELOW -----------------------------
 
-def _first(d: dict, keys: list[str], default=None):
-    """Safely fetch the first non-empty key from possibly nested dicts."""
+# ----------------------------- OPTIONAL HELPERS -----------------------------
+
+def _first(d: dict, keys: List[str], default=None):
+    """Safely fetch the first present & non-empty key."""
     for k in keys:
-        if k in d and d[k] not in (None, "", []):
+        if isinstance(d, dict) and k in d and d[k] not in (None, "", []):
             return d[k]
     return default
+
 
 def _join_nonempty(*vals, sep=" "):
     return sep.join(str(v) for v in vals if v not in (None, "", []))
 
-def _build_suggestions(profile: dict, subsidy: dict | None, lang: str = "ro") -> dict:
+
+def _build_suggestions(profile: dict, subsidy: Optional[dict] = None, lang: str = "ro") -> Dict[str, str]:
     """
-    Produce chei uzuale pentru formularele AIPA. Robuste la lipsa unor câmpuri.
-    profile: rezultat din app.services.farm_profile.load_farm_profile(conn, business_id)
-    subsidy: {"code": "...", "title": "..."} (opțional)
+    Produce common AIPA fields. Tolerant to missing pieces in 'profile'.
+    'profile' can be whatever your farm_profile/service returns.
     """
-    user = profile.get("user") or profile.get("primary_user") or {}
+    user = profile.get("user") or profile.get("utilizator") or {}
     business = profile.get("business") or {}
-    finance = profile.get("finance") or {}
-    fields = profile.get("fields") or []
-    animals = profile.get("animals") or []
-    vehicles = profile.get("vehicles") or []
+    finance = profile.get("finance") or profile.get("finante") or {}
+    fields = profile.get("fields") or profile.get("campuri") or []
+    animals = profile.get("animals") or profile.get("efective_animale") or []
+    vehicles = profile.get("vehicles") or profile.get("machines") or []
     cattle = profile.get("cattle") or []
 
     first_name = _first(user, ["firstName", "first_name", "firstname", "nume"])
-    last_name  = _first(user, ["lastName", "last_name", "lastname", "prenume"])
+    last_name = _first(user, ["lastName", "last_name", "lastname", "prenume"])
     solicitant = _join_nonempty(first_name, last_name) or "[Nume solicitant]"
-    idno       = _first(business, ["idno", "id", "businessId", "business_id"], _first(user, ["businessId", "business_id"]))
-    phone      = _first(user, ["phone", "telefon"])
-    email      = _first(user, ["email"])
-    denumire   = _first(business, ["name", "denumire", "title"], solicitant)
+    idno = _first(business, ["idno", "id", "businessId", "business_id"], _first(user, ["businessId", "business_id"]))
+    phone = _first(user, ["phone", "telefon"])
+    email = _first(user, ["email"])
+    denumire = _first(business, ["name", "denumire", "title"], solicitant)
 
-    # agregate terenuri
+    # fields aggregation
     total_ha = 0.0
-    crop_types = []
+    crop_types: List[str] = []
     for f in fields:
         try:
             if f.get("size") is not None:
@@ -114,17 +203,17 @@ def _build_suggestions(profile: dict, subsidy: dict | None, lang: str = "ro") ->
             crop_types.append(str(ct))
     crop_types_txt = ", ".join(sorted(set(crop_types))) if crop_types else "—"
 
-    # agregate animale
-    animal_counts = {}
+    # animals aggregation
+    animal_counts: Dict[str, int] = {}
     for a in animals:
-        sp = (a.get("species") or "").strip().lower() or "necunoscut"
-        animal_counts[sp] = animal_counts.get(sp, 0) + 1
+        sp = (a.get("species") or a.get("type") or "").strip().lower() or "necunoscut"
+        animal_counts[sp] = animal_counts.get(sp, 0) + int(a.get("amount") or 1)
     animale_txt = ", ".join(f"{k}: {v}" for k, v in animal_counts.items()) if animal_counts else "—"
 
-    # vehicule
+    # vehicles
     nr_veh = len(vehicles) if isinstance(vehicles, list) else 0
 
-    # bovine/capete din tabela cattle (dacă există)
+    # bovines if provided
     bovine = 0
     try:
         for c in cattle:
@@ -134,44 +223,40 @@ def _build_suggestions(profile: dict, subsidy: dict | None, lang: str = "ro") ->
     except Exception:
         pass
 
-    venit_anual = finance.get("yearlyIncome")
-    chelt_anual = finance.get("yearlyExpenses")
+    venit_anual = _first(finance, ["yearlyIncome", "inc"])
+    chelt_anual = _first(finance, ["yearlyExpenses", "exp"])
 
     su_code = (subsidy or {}).get("code") or ""
     su_title = (subsidy or {}).get("title") or ""
 
-    sugestii = {
+    suggestions = {
         "Denumirea solicitantului": denumire or solicitant,
         "Numele și prenumele": solicitant,
         "IDNO/Cod fiscal": idno or "[IDNO]",
         "Telefon": phone or "[Telefon]",
         "Email": email or "[Email]",
-        "Măsura/Program": _join_nonempty(su_code, su_title, sep=" – ") if su_code or su_title else "—",
+        "Măsura/Program": _join_nonempty(su_code, su_title, sep=" – ") if (su_code or su_title) else "—",
         "Suprafața totală exploatată (ha)": f"{total_ha:.2f}",
         "Culturile principale": crop_types_txt,
         "Efective de animale": animale_txt,
         "Număr vehicule agricole": str(nr_veh),
         "Efectiv bovine (capete)": str(bovine),
-    }
-    if venit_anual is not None:
-        sugestii["Venit anual (lei)"] = str(venit_anual)
-    if chelt_anual is not None:
-        sugestii["Cheltuieli anuale (lei)"] = str(chelt_anual)
-
-    # câteva câmpuri comune des întâlnite
-    sugestii.update({
         "Localitate": business.get("localitate") or business.get("address") or "[Localitate]",
         "Data completării": "[Auto-completare la tipărire]",
-    })
-    return sugestii
+    }
+    if venit_anual is not None:
+        suggestions["Venit anual (lei)"] = str(venit_anual)
+    if chelt_anual is not None:
+        suggestions["Cheltuieli anuale (lei)"] = str(chelt_anual)
 
-def _build_plan_5_ani(profile: dict, subsidy: dict | None, lang: str = "ro") -> str:
-    user = profile.get("user") or {}
+    return suggestions
+
+
+def _build_plan_5_ani(profile: dict, subsidy: Optional[dict] = None, lang: str = "ro") -> str:
+    user = profile.get("user") or profile.get("utilizator") or {}
     business = profile.get("business") or {}
     name = _join_nonempty(_first(user, ["firstName", "nume"]), _first(user, ["lastName", "prenume"])) or (business.get("name") or "Solicitant")
     su = (subsidy or {})
-    titlu = su.get("title") or su.get("code") or "Investiție agricolă"
-
     return (
         f"Plan investițional pe 5 ani – {name}\n"
         f"Măsura: {su.get('code','—')} – {su.get('title','—')}\n\n"
@@ -181,25 +266,26 @@ def _build_plan_5_ani(profile: dict, subsidy: dict | None, lang: str = "ro") -> 
         "Anul 3: Diversificare produse/servicii, îmbunătățire calitate, certificări dacă e cazul.\n"
         "Anul 4: Scalare și integrare verticală (prelucrare/comercializare), parteneriate noi.\n"
         "Anul 5: Consolidare poziție pe piață, evaluare rezultate, plan pentru reinvestirea profitului.\n\n"
-        "Indicatori urmăriți: productivitate/ha, randament utilaje, venit operațional, reducerea cheltuielilor, calitatea produselor.\n"
-        "Riscuri și măsuri: variație climatică (irigare/adaptarea tehnologiilor), volatilitate prețuri (contracte forward), "
-        "riscuri operaționale (mentenanță preventivă, asigurări).\n"
+        "Indicatori: productivitate/ha, randament utilaje, venit operațional, reducerea cheltuielilor, calitate.\n"
+        "Riscuri: climă (irigare/tehnologii adecvate), prețuri (contracte forward), operațional (mentenanță, asigurări).\n"
     )
 
-def prepare_documents(profile: dict, docs: list[dict], subsidy: dict | None = None, lang: str = "ro") -> dict:
+
+def prepare_documents(profile: dict, docs: List[dict], subsidy: Optional[dict] = None, lang: str = "ro") -> dict:
     """
     docs: [{ "url": "https://.../Cerere_SP_2.10.docx" }, ...]
-    Returnează: {
-       "files": [{"sourceUrl","filename","ext","b64"}],
-       "generated": {"plan_5_ani": "..."}
-    }
+    Returns:
+       {
+         "files": [{"sourceUrl","filename","ext","b64"}],
+         "generated": {"plan_5_ani": "..."}
+       }
     """
     suggestions = _build_suggestions(profile, subsidy, lang=lang)
-    out_files = []
+    out_files: List[dict] = []
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = pathlib.Path(tmpdir)
-        for item in docs:
+        for item in (docs or []):
             url = item.get("url")
             if not url:
                 continue
@@ -208,7 +294,7 @@ def prepare_documents(profile: dict, docs: list[dict], subsidy: dict | None = No
             src = tmp / src_name
             download_url(url, src)
 
-            dest_name = src.stem + "_precompletat" + src.suffix
+            dest_name = f"{pathlib.Path(src_name).stem}_precompletat.{ext or 'docx'}"
             dest = tmp / dest_name
 
             if ext == "docx":
@@ -216,7 +302,7 @@ def prepare_documents(profile: dict, docs: list[dict], subsidy: dict | None = No
             elif ext == "xlsx":
                 prefill_xlsx(src, dest, suggestions)
             else:
-                # Skip unknown ext, but still include as original base64
+                # Unknown type: pass-through original
                 dest = src
 
             b = dest.read_bytes()
@@ -229,9 +315,4 @@ def prepare_documents(profile: dict, docs: list[dict], subsidy: dict | None = No
             })
 
     plan = _build_plan_5_ani(profile, subsidy, lang=lang)
-    return {
-        "files": out_files,
-        "generated": {
-            "plan_5_ani": plan
-        }
-    }
+    return {"files": out_files, "generated": {"plan_5_ani": plan}}
