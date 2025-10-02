@@ -3,6 +3,11 @@
 This is the python backend service for FarmXpert a web platform that digitalizes the agricultural subsidy process in Moldova.  
 It provides **REST APIs** and **AI-powered features** to help farmers and government agencies manage subsidy applications, automate document handling, and ensure compliance with AIPA regulations.
 
+For the Blazor frontend web app of FarmXpert, acces the repository here: 
+```bash
+https://github.com/Klavrin/FarmXpert
+```
+
 ---
 
 ## Features
