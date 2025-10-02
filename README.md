@@ -24,7 +24,7 @@ cd farmxpert-backend
 pip install -r requirements.txt
 ```
 
-## Set environment variables
+## 2. Set environment variables
 
 ```bash
 DATABASE_URL="your_mongodb_url"
@@ -32,7 +32,7 @@ OPENAI_API_KEY="your_openai_api_key"
 GPT_MODEL="gpt-5-nano"
 ```
 
-## Run the server
+## 3. Run the server
 
 ```python
 flask run
