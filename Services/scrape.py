@@ -26,7 +26,7 @@ def safe_filename(name: str) -> str:
 def discover_file_links(page_url: str, allowed_exts=DEFAULT_EXTS, max_depth=2):
     """
     Recursively discover file links up to max_depth levels deep.
-    Returns (file_links, visited_pages)
+    Only keeps files matching measure numbers like "1.2", "5.3" etc.
     """
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -37,6 +37,10 @@ def discover_file_links(page_url: str, allowed_exts=DEFAULT_EXTS, max_depth=2):
         domain1 = urllib.parse.urlparse(url1).netloc
         domain2 = urllib.parse.urlparse(url2).netloc
         return domain1 == domain2
+    
+    def has_measure_number(url: str) -> bool:
+        # Match patterns like "1.2", "5.3" etc in the URL or filename
+        return bool(re.search(r'(?:^|\D)(\d+\.\d+)(?:\D|$)', url.lower()))
     
     def should_follow_link(href, base_url):
         if not href or not isinstance(href, str):
@@ -72,24 +76,30 @@ def discover_file_links(page_url: str, allowed_exts=DEFAULT_EXTS, max_depth=2):
                 href = a.get('href', '').strip()
                 abs_url = to_abs(href, current_url)
                 
-                # Check if it's a document
+                # Check if it's a document with measure number
                 path = urllib.parse.urlparse(abs_url).path.lower()
                 if any(path.endswith(ext) for ext in allowed_exts):
-                    file_links.add(abs_url)
+                    if has_measure_number(path):  # Only add if it has number.number pattern
+                        file_links.add(abs_url)
                     continue
 
-                # If not at max depth, add page links to visit
+                # If not at max depth, add page links to visit if they look relevant
                 if depth < max_depth and should_follow_link(href, current_url):
-                    # Keywords to prioritize relevant pages
-                    keywords = ['subventii', 'plata', 'ordine', 'documente', 'formulare']
-                    if any(kw in abs_url.lower() for kw in keywords):
+                    # Keywords expanded to catch measure numbers
+                    keywords = [
+                        'subventii', 'plata', 'ordine', 'documente', 'formulare',
+                        'masura', 'măsura', 'submăsura', 'submasura'
+                    ]
+                    # Add page if it has keywords or measure numbers
+                    if any(kw in abs_url.lower() for kw in keywords) or has_measure_number(abs_url):
                         pages_to_visit.append((abs_url, depth + 1))
 
         except Exception as e:
             print(f"Error accessing {current_url}: {e}")
             continue
 
-    return list(file_links) 
+    return list(file_links)
+
 
 def download(url: str, outdir: pathlib.Path) -> pathlib.Path:
     outdir.mkdir(parents=True, exist_ok=True)
