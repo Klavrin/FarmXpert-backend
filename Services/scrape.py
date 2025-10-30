@@ -7,7 +7,7 @@ from docx import Document as DocxDocument
 import pandas as pd
 import tempfile, shutil
 
-USE_OPENAI = True
+USE_OPENAI = False # disable AI for now
 try:
     from openai import OpenAI
 except Exception:
