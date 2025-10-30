@@ -7,7 +7,7 @@ from docx import Document as DocxDocument
 import pandas as pd
 import tempfile, shutil
 
-USE_OPENAI = True
+USE_OPENAI = False # disable AI for now
 try:
     from openai import OpenAI
 except Exception:
@@ -23,20 +23,83 @@ def safe_filename(name: str) -> str:
     name = re.sub(r'[:*?"<>|]', "_", name).strip()
     return name[:200] or "download"
 
-def discover_file_links(page_url: str, allowed_exts=DEFAULT_EXTS):
-    r = requests.get(page_url, timeout=30)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    out, seen = [], set()
-    for a in soup.select("a[href]"):
-        href = a.get("href") or ""
-        absu = to_abs(href, page_url)
-        path = urllib.parse.urlparse(absu).path.lower()
-        if any(path.endswith(ext) for ext in allowed_exts):
-            if absu not in seen:
-                seen.add(absu)
-                out.append(absu)
-    return out
+def discover_file_links(page_url: str, allowed_exts=DEFAULT_EXTS, max_depth=2):
+    """
+    Recursively discover file links up to max_depth levels deep.
+    Only keeps files matching measure numbers like "1.2", "5.3" etc.
+    """
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    }
+    
+    def is_same_domain(url1, url2):
+        domain1 = urllib.parse.urlparse(url1).netloc
+        domain2 = urllib.parse.urlparse(url2).netloc
+        return domain1 == domain2
+    
+    def has_measure_number(url: str) -> bool:
+        # Match patterns like "1.2", "5.3" etc in the URL or filename
+        return bool(re.search(r'(?:^|\D)(\d+\.\d+)(?:\D|$)', url.lower()))
+    
+    def should_follow_link(href, base_url):
+        if not href or not isinstance(href, str):
+            return False
+        # Convert relative URLs to absolute
+        abs_url = to_abs(href, base_url)
+        # Only follow links on same domain
+        if not is_same_domain(abs_url, base_url):
+            return False
+        # Skip anchors and javascript
+        if href.startswith(('#', 'javascript:', 'mailto:')):
+            return False
+        return True
+    
+    file_links = set()
+    visited_pages = set()
+    pages_to_visit = [(page_url, 0)]  # (url, depth)
+
+    while pages_to_visit:
+        current_url, depth = pages_to_visit.pop(0)
+        if current_url in visited_pages or depth > max_depth:
+            continue
+            
+        visited_pages.add(current_url)
+        
+        try:
+            r = requests.get(current_url, headers=headers, timeout=30)
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            # Find document links
+            for a in soup.find_all('a', href=True):
+                href = a.get('href', '').strip()
+                abs_url = to_abs(href, current_url)
+                
+                # Check if it's a document with measure number
+                path = urllib.parse.urlparse(abs_url).path.lower()
+                if any(path.endswith(ext) for ext in allowed_exts):
+                    if has_measure_number(path):  # Only add if it has number.number pattern
+                        file_links.add(abs_url)
+                    continue
+
+                # If not at max depth, add page links to visit if they look relevant
+                if depth < max_depth and should_follow_link(href, current_url):
+                    # Keywords expanded to catch measure numbers
+                    keywords = [
+                        'subventii', 'plata', 'ordine', 'documente', 'formulare',
+                        'masura', 'măsura', 'submăsura', 'submasura'
+                    ]
+                    # Add page if it has keywords or measure numbers
+                    if any(kw in abs_url.lower() for kw in keywords) or has_measure_number(abs_url):
+                        pages_to_visit.append((abs_url, depth + 1))
+
+        except Exception as e:
+            print(f"Error accessing {current_url}: {e}")
+            continue
+
+    return list(file_links)
+
 
 def download(url: str, outdir: pathlib.Path) -> pathlib.Path:
     outdir.mkdir(parents=True, exist_ok=True)
@@ -196,10 +259,12 @@ def summarize_with_openai(text: str, filename: str, *, lang: str = "ro", model: 
     }
     
 def scrape_and_summarize(pages: list[str], *, exts=DEFAULT_EXTS, lang="ro", save_dir: str | None = None, dry_run=False):
-    # Discover links
+    # Discover links recursively
     all_links = []
     for p in pages:
-        all_links.extend(discover_file_links(p, exts))
+        discovered = discover_file_links(p, exts, max_depth=2)  # Adjust max_depth as needed
+        all_links.extend(discovered)
+    
     # de-dupe
     all_links = list(dict.fromkeys(all_links))
     if dry_run:
