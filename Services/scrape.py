@@ -50,6 +50,46 @@ def discover_file_links(page_url: str, allowed_exts=DEFAULT_EXTS, max_depth=2):
         if href.startswith(('#', 'javascript:', 'mailto:')):
             return False
         return True
+    
+    file_links = set()
+    visited_pages = set()
+    pages_to_visit = [(page_url, 0)]  # (url, depth)
+
+    while pages_to_visit:
+        current_url, depth = pages_to_visit.pop(0)
+        if current_url in visited_pages or depth > max_depth:
+            continue
+            
+        visited_pages.add(current_url)
+        
+        try:
+            r = requests.get(current_url, headers=headers, timeout=30)
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            # Find document links
+            for a in soup.find_all('a', href=True):
+                href = a.get('href', '').strip()
+                abs_url = to_abs(href, current_url)
+                
+                # Check if it's a document
+                path = urllib.parse.urlparse(abs_url).path.lower()
+                if any(path.endswith(ext) for ext in allowed_exts):
+                    file_links.add(abs_url)
+                    continue
+
+                # If not at max depth, add page links to visit
+                if depth < max_depth and should_follow_link(href, current_url):
+                    # Keywords to prioritize relevant pages
+                    keywords = ['subventii', 'plata', 'ordine', 'documente', 'formulare']
+                    if any(kw in abs_url.lower() for kw in keywords):
+                        pages_to_visit.append((abs_url, depth + 1))
+
+        except Exception as e:
+            print(f"Error accessing {current_url}: {e}")
+            continue
+
+    return list(file_links)
 
 def download(url: str, outdir: pathlib.Path) -> pathlib.Path:
     outdir.mkdir(parents=True, exist_ok=True)
