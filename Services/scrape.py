@@ -89,7 +89,7 @@ def discover_file_links(page_url: str, allowed_exts=DEFAULT_EXTS, max_depth=2):
             print(f"Error accessing {current_url}: {e}")
             continue
 
-    return list(file_links)
+    return list(file_links) 
 
 def download(url: str, outdir: pathlib.Path) -> pathlib.Path:
     outdir.mkdir(parents=True, exist_ok=True)
@@ -249,10 +249,12 @@ def summarize_with_openai(text: str, filename: str, *, lang: str = "ro", model: 
     }
     
 def scrape_and_summarize(pages: list[str], *, exts=DEFAULT_EXTS, lang="ro", save_dir: str | None = None, dry_run=False):
-    # Discover links
+    # Discover links recursively
     all_links = []
     for p in pages:
-        all_links.extend(discover_file_links(p, exts))
+        discovered = discover_file_links(p, exts, max_depth=2)  # Adjust max_depth as needed
+        all_links.extend(discovered)
+    
     # de-dupe
     all_links = list(dict.fromkeys(all_links))
     if dry_run:
