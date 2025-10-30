@@ -23,20 +23,33 @@ def safe_filename(name: str) -> str:
     name = re.sub(r'[:*?"<>|]', "_", name).strip()
     return name[:200] or "download"
 
-def discover_file_links(page_url: str, allowed_exts=DEFAULT_EXTS):
-    r = requests.get(page_url, timeout=30)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    out, seen = [], set()
-    for a in soup.select("a[href]"):
-        href = a.get("href") or ""
-        absu = to_abs(href, page_url)
-        path = urllib.parse.urlparse(absu).path.lower()
-        if any(path.endswith(ext) for ext in allowed_exts):
-            if absu not in seen:
-                seen.add(absu)
-                out.append(absu)
-    return out
+def discover_file_links(page_url: str, allowed_exts=DEFAULT_EXTS, max_depth=2):
+    """
+    Recursively discover file links up to max_depth levels deep.
+    Returns (file_links, visited_pages)
+    """
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    }
+    
+    def is_same_domain(url1, url2):
+        domain1 = urllib.parse.urlparse(url1).netloc
+        domain2 = urllib.parse.urlparse(url2).netloc
+        return domain1 == domain2
+    
+    def should_follow_link(href, base_url):
+        if not href or not isinstance(href, str):
+            return False
+        # Convert relative URLs to absolute
+        abs_url = to_abs(href, base_url)
+        # Only follow links on same domain
+        if not is_same_domain(abs_url, base_url):
+            return False
+        # Skip anchors and javascript
+        if href.startswith(('#', 'javascript:', 'mailto:')):
+            return False
+        return True
 
 def download(url: str, outdir: pathlib.Path) -> pathlib.Path:
     outdir.mkdir(parents=True, exist_ok=True)
