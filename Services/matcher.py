@@ -68,54 +68,82 @@ def _cmp(val, op, tgt, rule=None):
     return False
 
 def _collect(records: List[Dict[str,Any]], field: str) -> List[Any]:
-    # field like "field.cropType"
     parts = field.split(".")
     out = []
     for r in records:
         v = r
-        for p in parts:
-            v = v.get(p) if isinstance(v, dict) else None
+        for p in parts[1:]:  # skip table prefix
+            if not isinstance(v, dict):
+                v = None; break
+            v = v.get(p)
         out.append(v)
     return out
 
+
 def evaluate_rule_set(rule_set: Dict[str,Any], dataset: Dict[str,List[Dict[str,Any]]]) -> Dict[str,Any]:
     """
-    dataset keys expected from Supabase: users, field, cattle, animal, finance, vehicle, vehicleGroup
-    Returns {passed:bool, details:[...], score:float}
+    Enhanced evaluator with weights, fuzzy, regex and explainability.
+    rule format (example):
+      { "field": "field.cropType", "op": "fuzzy", "value": "pom", "weight": 2, "aggregate":"any", "threshold": 0.6 }
+    Returns:
+      { passed:bool, score:float (0..1), details:[{rule,passed,weight,contribution,found_values}] }
     """
     details = []
-    total, ok = 0, 0
+    total_weight = 0.0
+    score_acc = 0.0
+    # default rules live under "all" (keep existing shape)
+    rules = rule_set.get("all", [])
 
-    for rule in rule_set.get("all", []):
-        total += 1
+    if not rules:
+        return {"passed": True, "score": 1.0, "details": []}
+
+    for rule in rules:
+        weight = float(rule.get("weight", 1.0))
+        total_weight += weight
+
         field = rule.get("field")
         op    = rule.get("op")
         tgt   = rule.get("value")
-        agg   = rule.get("aggregate","one")  # 'any' over a table, or single value
+        agg   = rule.get("aggregate", "one")  # one|any|count>= etc.
 
-        # table name is the first part
-        table = field.split(".")[0]
-        rows  = dataset.get(table, [])
-
+        table = field.split(".")[0] if field else None
+        # rows may be missing; default to []
+        rows = dataset.get(table, []) if table else []
         passed = False
+        found = []
+
         if agg == "any":
             vals = _collect(rows, field)
-            passed = any(_cmp(v, op, tgt) for v in vals)
+            for v in vals:
+                found.append(v)
+                if _cmp(v, op, tgt, rule):
+                    passed = True
+                    break
         elif agg == "count>=":
-            # rule.value is minimal count; compare count of non-empty matching rows
             vals = _collect(rows, field)
-            cnt  = sum(1 for v in vals if _cmp(v, "in" if isinstance(tgt,list) else "==", tgt))
-            passed = cnt >= (rule.get("min", 1))
-        else:
-            # try to read the first row or 'users' single row
-            if table == "users":
-                v = rows[0].get(field.split(".",1)[1]) if rows else None
+            cnt = sum(1 for v in vals if _cmp(v, "in" if isinstance(tgt, list) else "==", tgt))
+            required = int(rule.get("min", 1))
+            passed = cnt >= required
+            found = vals
+        else:  # single-value check (first row)
+            if rows:
+                v = _collect(rows, field)[0]
             else:
-                v = rows[0].get(field.split(".",1)[1]) if rows else None
-            passed = _cmp(v, op, tgt)
+                v = None
+            found = [v]
+            passed = _cmp(v, op, tgt, rule)
 
-        details.append({"rule": rule, "passed": passed})
-        if passed: ok += 1
+        contrib = weight if passed else 0.0
+        score_acc += contrib
 
-    score = ok / total if total else 0.0
-    return {"passed": ok == total, "details": details, "score": round(score, 3)}
+        details.append({
+            "rule": rule,
+            "passed": bool(passed),
+            "weight": weight,
+            "contribution": contrib,
+            "found_values": found,
+        })
+
+    overall_score = (score_acc / total_weight) if total_weight else 0.0
+    overall_passed = all(d["passed"] for d in details if d["rule"].get("required", True))
+    return {"passed": bool(overall_passed), "score": round(overall_score, 3), "details": details}
