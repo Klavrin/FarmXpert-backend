@@ -1,7 +1,10 @@
-# app/services/doc_fill.py
-from __future__ import annotations
-import io, re, pathlib, json, base64, tempfile, urllib.parse
-from typing import Dict, Any, Tuple, List, Optional
+import os
+import re
+import io
+import pathlib
+from typing import Dict, Any, Optional
+from docx import Document
+from openpyxl import load_workbook
 
 UNDERSCORES = re.compile(r"_{4,}")  # sequences of 4+ underscores
 
