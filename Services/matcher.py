@@ -1,6 +1,32 @@
-# Services/matcher.py
 from __future__ import annotations
 from typing import Any, Dict, List
+import re
+from datetime import datetime
+from difflib import SequenceMatcher
+
+#helpers
+
+def _norm_str(x):
+    return (x or "").strip().lower() if x is not None else None
+
+def _parse_number(x):
+    try:
+        if x is None: return None
+        if isinstance(x, (int, float)): return x
+        s = str(x).replace(",", ".").strip()
+        return float(re.sub(r"[^\d\.\-]", "", s)) if s else None
+    except Exception:
+        return None
+
+def _parse_date(x):
+    if not x: return None
+    if isinstance(x, datetime): return x
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(str(x).strip(), fmt)
+        except Exception:
+            pass
+    return None
 
 # Basic ops
 def _cmp(val, op, tgt):
