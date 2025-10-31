@@ -98,6 +98,12 @@ def _pick_suggestion(label: str, suggestions: Dict[str, str]) -> Optional[str]:
             best = v
     return best if best_score >= 0.25 else None
 
+def _normalize_suggestions(sug: Dict[str, Any]) -> Dict[str, str]:
+    out = {}
+    for k, v in (sug or {}).items():
+        nk = _slug_label(str(k))
+        out[nk] = str(v) if v is not None else ""
+    return out
 
 def safe_filename(name: str) -> str:
     """Sanitize a filename (keeps extension if present)."""
@@ -125,81 +131,95 @@ def download_url(url: str, dest: pathlib.Path) -> pathlib.Path:
                     f.write(chunk)
     return dest
 
-
-def prefill_docx(src_path: pathlib.Path, dest_path: pathlib.Path, suggestions: Dict[str, str]):
+def prefill_docx(src: pathlib.Path, dest: pathlib.Path, suggestions: Dict[str, Any], instructions: str | None = None, language: str = "ro"):
     """
-    Replace underscore blanks with suggested values, preserving the first run formatting.
+    Fill blanks and label-right cells in a .docx using suggestions dict.
+    suggestions keys are matched case-insensitively and normalized.
     """
-    try:
-        from docx import Document  # lazy import
-    except Exception:
-        dest_path.write_bytes(src_path.read_bytes())
-        return
+    suggestions = _normalize_suggestions(suggestions)
+    doc = Document(str(src))
 
-    try:
-        doc = Document(str(src_path))
-    except Exception:
-        # fallback minimal doc
-        doc = Document()
-        doc.add_paragraph("CERERE (șablon indisponibil – s-a generat un document minimal)")
-        for k, v in (suggestions or {}).items():
-            doc.add_paragraph(f"{k}: {v}")
+    # 1) Tables: left label + blank right cell
+    for table in doc.tables:
+        for row in table.rows:
+            cells = row.cells
+            if len(cells) < 2:
+                continue
+            for i in range(len(cells) - 1):
+                left_txt = _clean_ws(cells[i].text)
+                right_txt = _clean_ws(cells[i+1].text)
+                if left_txt and _is_blankish(right_txt):
+                    pick = _pick_suggestion(left_txt, suggestions)
+                    if pick:
+                        # clear cell and set text
+                        try:
+                            cells[i+1].text = str(pick)
+                        except Exception:
+                            # best-effort: append run
+                            cells[i+1].paragraphs[0].add_run(str(pick))
 
-    values = list((suggestions or {}).values()) or ["[completați]"]
-    idx = 0
+    # 2) Paragraphs: blanks inside paragraph (____ or ....) -> add «value»
+    for p in list(doc.paragraphs):
+        text = p.text or ""
+        if not text:
+            continue
+        if _BLANK_RE.search(text):
+            # try guess label from left context
+            m = _BLANK_RE.search(text)
+            left = text[:m.start()]
+            # label candidate is last 6-10 words left of blank
+            lbl = " ".join(re.findall(r"\w+", left)[-6:])
+            val = _pick_suggestion(lbl, suggestions) or _pick_suggestion(left, suggestions)
+            if val:
+                # replace by preserving blank and appending «val»
+                new_text = text[:m.end()] + f" «{val}»" + text[m.end():]
+                # replace paragraph text (simpler: clear runs and write one run)
+                for run in list(p.runs):
+                    try: run.text = ""
+                    except Exception: pass
+                p.add_run(new_text)
 
-    for para in list(doc.paragraphs):
-        if UNDERSCORES.search(para.text):
-            v = values[min(idx, len(values) - 1)]
-            idx += 1
-            new_text = UNDERSCORES.sub(v, para.text, count=1)
-            # preserve first run formatting
-            first_run = para.runs[0] if para.runs else None
-            for run in list(para.runs):
-                try:
-                    run.text = ""
-                except Exception:
-                    pass
-            new_run = para.add_run(new_text)
-            if first_run:
-                try:
-                    _copy_run_formatting(first_run, new_run)
-                except Exception:
-                    pass
+    # 3) Label-only paragraphs followed by blank paragraph
+    paras = list(doc.paragraphs)
+    for idx, p in enumerate(paras):
+        t = _clean_ws(p.text)
+        if not t:
+            continue
+        # treat as label-only if short and looks like label (contains letters and few words)
+        if 1 <= len(t.split()) <= 8 and len(t) < 100:
+            nxt = paras[idx+1].text if idx + 1 < len(paras) else ""
+            if _is_blankish(nxt):
+                val = _pick_suggestion(t, suggestions)
+                if val:
+                    p.add_run(f" «{val}»")
 
-    bio = io.BytesIO()
-    doc.save(bio)
-    dest_path.write_bytes(bio.getvalue())
+    ensure_dir(dest.parent)
+    doc.save(str(dest))
 
-
-def prefill_xlsx(src_path: pathlib.Path, dest_path: pathlib.Path, suggestions: Dict[str, str]):
+def prefill_xlsx(src: pathlib.Path, dest: pathlib.Path, suggestions: Dict[str, Any], instructions: str | None = None, language: str = "ro"):
     """
-    Non-destructive: create a 'PROPUNERI' sheet with key->value pairs.
-    If openpyxl isn't installed or file can't be parsed, fall back to copying.
+    Very small XLSX prefill: if a cell is blank and the cell to its left is a short label,
+    fill from suggestions.
     """
-    try:
-        import openpyxl  # lazy import
-    except Exception:
-        dest_path.write_bytes(src_path.read_bytes())
-        return
-
-    try:
-        wb = openpyxl.load_workbook(str(src_path))
-    except Exception:
-        wb = openpyxl.Workbook()
-
-    try:
-        ws = wb.create_sheet("PROPUNERI")
-        ws.append(["cheie", "valoare"])
-        for k, v in (suggestions or {}).items():
-            ws.append([k, v])
-        wb.save(str(dest_path))
-    finally:
-        try:
-            wb.close()
-        except Exception:
-            pass
-
+    suggestions = _normalize_suggestions(suggestions)
+    wb = load_workbook(filename=str(src))
+    for ws in wb.worksheets:
+        max_row = ws.max_row
+        max_col = ws.max_column
+        for r in range(1, max_row + 1):
+            for c in range(2, max_col + 1):
+                cell = ws.cell(row=r, column=c)
+                left = ws.cell(row=r, column=c-1)
+                if (cell.value is None or (isinstance(cell.value, str) and not cell.value.strip())) and left and left.value:
+                    label = str(left.value)
+                    pick = _pick_suggestion(label, suggestions)
+                    if pick:
+                        try:
+                            cell.value = pick
+                        except Exception:
+                            pass
+    ensure_dir(dest.parent)
+    wb.save(str(dest))
 
 # ----------------------------- OPTIONAL HELPERS -----------------------------
 
