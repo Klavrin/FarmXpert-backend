@@ -7,6 +7,8 @@ from docx import Document
 from openpyxl import load_workbook
 
 UNDERSCORES = re.compile(r"_{4,}")  # sequences of 4+ underscores
+_BLANK_RE = re.compile(r"(?:_{3,}|\.{3,}|–{3,}|—{3,})")
+NBSP = "\u00A0"
 
 
 def _copy_run_formatting(src_run, dst_run):
@@ -53,6 +55,48 @@ def _copy_run_formatting(src_run, dst_run):
 
 def ensure_dir(p: pathlib.Path):
     p.mkdir(parents=True, exist_ok=True)
+
+def _clean_ws(s: Optional[str]) -> str:
+    return (s or "").replace(NBSP, " ").strip()
+
+def _is_blankish(s: Optional[str]) -> bool:
+    t = _clean_ws(s)
+    if not t:
+        return True
+    if BLANK_RE.match(t):
+        return True
+    return t in {".", "..", "…", "-"}  
+
+def _slug_label(s: str) -> str:
+    s = _clean_ws(s).lower()
+    s = re.sub(r"[^a-z0-9ăâîșț\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _pick_suggestion(label: str, suggestions: Dict[str, str]) -> Optional[str]:
+    if not label:
+        return None
+    key = _slug_label(label)
+    # direct match
+    if key in suggestions:
+        return suggestions[key]
+    # try simple substring match on keys or label
+    for k, v in suggestions.items():
+        if k in key or key in k:
+            return v
+    # token overlap fallback
+    words_label = set(k for k in key.split() if k)
+    best = None
+    best_score = 0
+    for k, v in suggestions.items():
+        toks = set(k.split())
+        if not toks or not words_label:
+            continue
+        score = len(toks & words_label) / len(toks | words_label)
+        if score > best_score:
+            best_score = score
+            best = v
+    return best if best_score >= 0.25 else None
 
 
 def safe_filename(name: str) -> str:
