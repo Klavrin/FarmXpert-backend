@@ -9,6 +9,7 @@ from app.services.farm_profile import load_farm_profile
 from app.services.ai_score import score_one, infer_code_from_filename
 from app.services.doc_fill import prefill_docx, prefill_xlsx, ensure_dir
 from app.services.suggest_fields import suggest_field_values
+from Services.matcher import evaluate_rule_set
 
 bp_sub = Blueprint("subsidies", __name__, url_prefix="/api")
 
@@ -219,3 +220,22 @@ def apply_submit():
             "status": "submitted",
             "mesaj": "Dosarul a fost pregătit. Descărcați fișierele și încărcați-le pe portalul AIPA."
         })
+
+@bp.post("/eligibility")
+def eligibility_check():
+    """
+    POST JSON:
+    {
+      "rule_set": { "all": [ {field, op, value, aggregate, weight, threshold, required, ...}, ... ] },
+      "dataset": { "users": [...], "field": [...], "finance": [...], ... }
+    }
+    Returns: evaluate_rule_set(...) result
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    rule_set = data.get("rule_set") or {}
+    dataset = data.get("dataset") or {}
+    try:
+        res = evaluate_rule_set(rule_set, dataset)
+        return jsonify(res)
+    except Exception as e:
+        return jsonify(error="evaluation_failed", details=str(e)), 500
