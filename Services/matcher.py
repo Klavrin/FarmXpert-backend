@@ -28,16 +28,43 @@ def _parse_date(x):
             pass
     return None
 
-# Basic ops
-def _cmp(val, op, tgt):
-    if op == "==":  return val == tgt
-    if op == "!=":  return val != tgt
-    if op == ">=":  return (val is not None) and (tgt is not None) and (val >= tgt)
-    if op == "<=":  return (val is not None) and (tgt is not None) and (val <= tgt)
-    if op == ">":   return (val is not None) and (tgt is not None) and (val > tgt)
-    if op == "<":   return (val is not None) and (tgt is not None) and (val < tgt)
-    if op == "in":  return val in (tgt or [])
-    if op == "any_in": return bool(set(val or []) & set(tgt or []))
+def _fuzzy_score(a, b):
+    a = _norm_str(a) or ""
+    b = _norm_str(b) or ""
+    return SequenceMatcher(None, a, b).ratio()
+
+def _cmp(val, op, tgt, rule=None):
+    # normalize
+    rule = rule or {}
+    if op == "exists":
+        return val is not None and val != ""
+    if op == "==":
+        return val == tgt
+    if op == "!=":
+        return val != tgt
+    if op in (">=", "<=", ">", "<"):
+        v = _parse_number(val)
+        t = _parse_number(tgt)
+        if v is None or t is None: return False
+        if op == ">=": return v >= t
+        if op == "<=": return v <= t
+        if op == ">": return v > t
+        if op == "<": return v < t
+    if op == "in":
+        return val in (tgt or [])
+    if op == "any_in":
+        return bool(set(val or []) & set(tgt or []))
+    if op == "contains":
+        return (_norm_str(tgt) or "") in (_norm_str(val) or "")
+    if op == "matches":
+        try:
+            return bool(re.search(tgt, str(val or ""), flags=re.IGNORECASE))
+        except Exception:
+            return False
+    if op == "fuzzy":
+        # rule may carry threshold (0..1)
+        thr = float(rule.get("threshold", 0.7))
+        return _fuzzy_score(val, tgt) >= thr
     return False
 
 def _collect(records: List[Dict[str,Any]], field: str) -> List[Any]:
