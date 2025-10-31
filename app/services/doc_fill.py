@@ -1,8 +1,11 @@
 import os
 import re
 import io
+import base64
+import tempfile
 import pathlib
-from typing import Dict, Any, Optional
+import urllib.parse
+from typing import Dict, Any, Optional, List
 from docx import Document
 from openpyxl import load_workbook
 
@@ -63,9 +66,9 @@ def _is_blankish(s: Optional[str]) -> bool:
     t = _clean_ws(s)
     if not t:
         return True
-    if BLANK_RE.match(t):
+    if _BLANK_RE.match(t):
         return True
-    return t in {".", "..", "…", "-"}  
+    return t in {".", "..", "…", "-"}
 
 def _slug_label(s: str) -> str:
     s = _clean_ws(s).lower()
@@ -77,17 +80,17 @@ def _pick_suggestion(label: str, suggestions: Dict[str, str]) -> Optional[str]:
     if not label:
         return None
     key = _slug_label(label)
-    # direct match
+    # Direct match
     if key in suggestions:
         return suggestions[key]
-    # try simple substring match on keys or label
+    # Substring match
     for k, v in suggestions.items():
         if k in key or key in k:
             return v
-    # token overlap fallback
+    # Fuzzy match
     words_label = set(k for k in key.split() if k)
     best = None
-    best_score = 0
+    best_score = 0.0
     for k, v in suggestions.items():
         toks = set(k.split())
         if not toks or not words_label:
@@ -106,11 +109,8 @@ def _normalize_suggestions(sug: Dict[str, Any]) -> Dict[str, str]:
     return out
 
 def safe_filename(name: str) -> str:
-    """Sanitize a filename (keeps extension if present)."""
     name = urllib.parse.unquote(str(name or "")).strip()
-    # Replace filesystem-unfriendly chars
     name = re.sub(r'[\\/:*?"<>|]', "_", name)
-    # Collapse whitespace
     name = re.sub(r"\s+", " ", name).strip()
     return (name[:200] or "document")
 
@@ -132,14 +132,11 @@ def download_url(url: str, dest: pathlib.Path) -> pathlib.Path:
     return dest
 
 def prefill_docx(src: pathlib.Path, dest: pathlib.Path, suggestions: Dict[str, Any], instructions: str | None = None, language: str = "ro"):
-    """
-    Fill blanks and label-right cells in a .docx using suggestions dict.
-    suggestions keys are matched case-insensitively and normalized.
-    """
+    """Fill blanks and label-right cells in a .docx using suggestions dict."""
     suggestions = _normalize_suggestions(suggestions)
     doc = Document(str(src))
 
-    # 1) Tables: left label + blank right cell
+    # Process tables
     for table in doc.tables:
         for row in table.rows:
             cells = row.cells
@@ -147,69 +144,52 @@ def prefill_docx(src: pathlib.Path, dest: pathlib.Path, suggestions: Dict[str, A
                 continue
             for i in range(len(cells) - 1):
                 left_txt = _clean_ws(cells[i].text)
-                right_txt = _clean_ws(cells[i+1].text)
+                right_txt = _clean_ws(cells[i + 1].text)
                 if left_txt and _is_blankish(right_txt):
                     pick = _pick_suggestion(left_txt, suggestions)
                     if pick:
-                        # clear cell and set text
                         try:
-                            cells[i+1].text = str(pick)
+                            cells[i + 1].text = str(pick)
                         except Exception:
-                            # best-effort: append run
-                            cells[i+1].paragraphs[0].add_run(str(pick))
+                            try:
+                                cells[i + 1].paragraphs[0].add_run(str(pick))
+                            except Exception:
+                                pass
 
-    # 2) Paragraphs: blanks inside paragraph (____ or ....) -> add «value»
-    for p in list(doc.paragraphs):
+    for p in doc.paragraphs:
         text = p.text or ""
         if not text:
             continue
-        if _BLANK_RE.search(text):
-            # try guess label from left context
-            m = _BLANK_RE.search(text)
+        m = _BLANK_RE.search(text)
+        if m:
             left = text[:m.start()]
-            # label candidate is last 6-10 words left of blank
             lbl = " ".join(re.findall(r"\w+", left)[-6:])
             val = _pick_suggestion(lbl, suggestions) or _pick_suggestion(left, suggestions)
             if val:
-                # replace by preserving blank and appending «val»
                 new_text = text[:m.end()] + f" «{val}»" + text[m.end():]
-                # replace paragraph text (simpler: clear runs and write one run)
                 for run in list(p.runs):
-                    try: run.text = ""
-                    except Exception: pass
+                    try:
+                        run.text = ""
+                    except Exception:
+                        pass
                 p.add_run(new_text)
-
-    # 3) Label-only paragraphs followed by blank paragraph
-    paras = list(doc.paragraphs)
-    for idx, p in enumerate(paras):
-        t = _clean_ws(p.text)
-        if not t:
-            continue
-        # treat as label-only if short and looks like label (contains letters and few words)
-        if 1 <= len(t.split()) <= 8 and len(t) < 100:
-            nxt = paras[idx+1].text if idx + 1 < len(paras) else ""
-            if _is_blankish(nxt):
-                val = _pick_suggestion(t, suggestions)
-                if val:
-                    p.add_run(f" «{val}»")
 
     ensure_dir(dest.parent)
     doc.save(str(dest))
 
+
 def prefill_xlsx(src: pathlib.Path, dest: pathlib.Path, suggestions: Dict[str, Any], instructions: str | None = None, language: str = "ro"):
-    """
-    Very small XLSX prefill: if a cell is blank and the cell to its left is a short label,
-    fill from suggestions.
-    """
+    """Fill Excel cells based on left-cell labels."""
     suggestions = _normalize_suggestions(suggestions)
     wb = load_workbook(filename=str(src))
+    
     for ws in wb.worksheets:
         max_row = ws.max_row
         max_col = ws.max_column
         for r in range(1, max_row + 1):
             for c in range(2, max_col + 1):
                 cell = ws.cell(row=r, column=c)
-                left = ws.cell(row=r, column=c-1)
+                left = ws.cell(row=r, column=c - 1)
                 if (cell.value is None or (isinstance(cell.value, str) and not cell.value.strip())) and left and left.value:
                     label = str(left.value)
                     pick = _pick_suggestion(label, suggestions)
@@ -218,8 +198,10 @@ def prefill_xlsx(src: pathlib.Path, dest: pathlib.Path, suggestions: Dict[str, A
                             cell.value = pick
                         except Exception:
                             pass
+
     ensure_dir(dest.parent)
     wb.save(str(dest))
+
 
 # ----------------------------- OPTIONAL HELPERS -----------------------------
 
