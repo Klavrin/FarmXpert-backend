@@ -43,24 +43,3 @@ GPT_MODEL="gpt-5-nano"
 flask run
 ```
 
-## API endpoints
-
-POST /api/match/ai
-
-    → Returns AI-ranked subsidy matches for a business profile.
-
-POST /api/apply/fill
-
-    → Auto-fills a document using farm and subsidy data.
-
-GET /api/apply/download/<app_id>/<doc_id>
-
-    → Download a generated/filled application document.
-
-POST /api/scraper/complete-docx
-
-    → Auto-complete a DOCX form using AI and profile data.
-
-GET /api/scraper/autocomplete
-
-    → Autocomplete subsidy forms.
