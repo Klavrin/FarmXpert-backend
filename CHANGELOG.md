@@ -1,5 +1,16 @@
 # Changelog
 
+## 2025-11-02
+
+### Added
+
+- API reference
+  - Summary: Adds a concise markdown listing of the most important HTTP endpoints, with an example request body and handler locations.
+  - Impact: Clearer developer docs.
+  - Meta: 1 file added, +97 −0
+  - Commit: https://github.com/Klavrin/FarmXpert-backend/commit/c9ce2bc883e8ff95cb06d5594d3139a94f4361d5
+  - Authors: @kynexi
+
 ## 2025-10-31
 
 ### Fixed
